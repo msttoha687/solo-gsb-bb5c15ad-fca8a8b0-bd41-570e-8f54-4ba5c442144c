@@ -24,7 +24,11 @@
 * 旧库**首次升级**（快照表尚不存在/为空）时，在初始化阶段给当前池
   版本补存一份基线快照，此后该版本及后续版本均可查询；
 * 快照只追加、从不更新：旧版本的状态不随后续写入变化，查询时依据
-  快照内容重新计算该版本下的空闲 CIDR。
+  快照内容重新计算该版本下的空闲 CIDR；
+* 两版本地址用途比较（``get_version_diff``）同样只读快照表：在单条
+  读事务的同一快照内取出两份快照，按**地址集合**（而非记录边界）对
+  保留、已分配地址分别求差，记录的拆分/合并不会产生伪变化；任一
+  版本缺失返回 ``None``，绝不以当前在线池状态代替旧快照。
 """
 from __future__ import annotations
 
@@ -39,6 +43,7 @@ from .allocator import (
     _network_bounds,
     _ranges_to_cidrs,
     _subtract_ranges,
+    address_set_diff,
 )
 from .config import Settings
 
@@ -83,6 +88,22 @@ class PoolState:
     version: int
     reserved: tuple[ipaddress._BaseNetwork, ...]
     allocated: tuple[ipaddress._BaseNetwork, ...]
+
+
+@dataclass(frozen=True)
+class VersionDiff:
+    """两个历史版本快照的地址用途差异（方向：left -> right）。
+
+    added/removed 均按地址集合求差后折叠为数量最少的规范 CIDR，并按
+    (网络地址, 前缀长度) 排序；同一地址集的记录拆分/合并不会产生差异。
+    """
+
+    left_version: int
+    right_version: int
+    reserved_added: tuple[ipaddress._BaseNetwork, ...]
+    reserved_removed: tuple[ipaddress._BaseNetwork, ...]
+    allocated_added: tuple[ipaddress._BaseNetwork, ...]
+    allocated_removed: tuple[ipaddress._BaseNetwork, ...]
 
 
 class ConflictError(Exception):
@@ -282,6 +303,83 @@ class Database:
             if r["kind"] == "allocated"
         )
         return PoolState(parent, version, reserved, allocated)
+
+    def get_version_diff(
+        self, left_version: int, right_version: int
+    ) -> VersionDiff | None:
+        """比较两个**历史版本**快照的保留 / 已分配地址集合差异。
+
+        方向为 ``left_version -> right_version``：added 属于右版本但不
+        属于左版本，removed 反之。两份快照在同一条读事务的同一 SQLite
+        快照内从 ``pool_versions`` / ``pool_version_subnets`` 读取，与在线
+        池状态（``pool_meta`` / ``subnets``）完全无关——绝不以当前池状态
+        代替旧快照，也不会产生任何写入；旧快照只追加、从不更新。
+
+        任一版本不存在返回 ``None``（由接口层转为 404）。差异按**地址
+        集合**求差：两版本对同一地址集的不同记录切分（一条 /24 与两条
+        相邻 /25）不会出现在差集中；差集再折叠为数量最少的规范 CIDR，
+        按 (网络地址, 前缀长度) 排序。
+        """
+        wanted = (left_version, right_version)
+        with self._conn() as conn:
+            conn.execute("BEGIN")
+            metas = {
+                row["version"]: row["parent_cidr"]
+                for row in conn.execute(
+                    "SELECT version, parent_cidr FROM pool_versions "
+                    "WHERE version IN (?, ?)",
+                    wanted,
+                ).fetchall()
+            }
+            missing = [v for v in wanted if v not in metas]
+            if missing:
+                conn.commit()
+                return None
+            rows = conn.execute(
+                "SELECT version, cidr, kind FROM pool_version_subnets "
+                "WHERE version IN (?, ?)",
+                wanted,
+            ).fetchall()
+            conn.commit()
+
+        grouped: dict[int, dict[str, list]] = {
+            v: {"reserved": [], "allocated": []} for v in wanted
+        }
+        for row in rows:
+            grouped[row["version"]][row["kind"]].append(
+                ipaddress.ip_network(row["cidr"], strict=True)
+            )
+
+        # 同一地址池的父网段恒定（仅 pool_meta 存父网段且从不改写）；
+        # 两份快照理论上必然同族同宽，仍以左版本父网段为准并防御性核对。
+        parent = ipaddress.ip_network(
+            metas[left_version], strict=True
+        )
+        if metas[right_version] != metas[left_version]:
+            raise ConflictError(
+                f"versions {left_version} and {right_version} belong to "
+                f"different pools"
+            )
+
+        left_sets, right_sets = grouped[left_version], grouped[right_version]
+        reserved_added, reserved_removed = address_set_diff(
+            parent.max_prefixlen,
+            left_sets["reserved"],
+            right_sets["reserved"],
+        )
+        allocated_added, allocated_removed = address_set_diff(
+            parent.max_prefixlen,
+            left_sets["allocated"],
+            right_sets["allocated"],
+        )
+        return VersionDiff(
+            left_version=left_version,
+            right_version=right_version,
+            reserved_added=tuple(reserved_added),
+            reserved_removed=tuple(reserved_removed),
+            allocated_added=tuple(allocated_added),
+            allocated_removed=tuple(allocated_removed),
+        )
 
     # -- 原子提交 ----------------------------------------------------------
 

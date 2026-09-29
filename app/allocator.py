@@ -119,6 +119,43 @@ def _ranges_to_cidrs(
     return cidrs
 
 
+def address_set_diff(
+    width: int,
+    left: list[IPNetwork],
+    right: list[IPNetwork],
+) -> tuple[list[IPNetwork], list[IPNetwork]]:
+    """按**地址集合**而非记录边界比较两组 CIDR，返回 (added, removed)。
+
+    ``added`` 为属于 ``right`` 但不属于 ``left`` 的地址，``removed`` 为属于
+    ``left`` 但不属于 ``right`` 的地址。两侧 CIDR 允许重叠、相邻或非最小
+    切分：先各自把地址区间合并为连续段，再做集合求差。因此同一地址集在
+    一个版本中记作一条 /24、在另一版本中记作两条相邻 /25（或反之）时，
+    差集为空，不会因为记录的拆分/合并产生伪变化。
+
+    每个差集（天然是若干互不相连的整数区间）都经过
+    :func:`_ranges_to_cidrs` 贪心切分，得到覆盖该地址集合且**数量最少**
+    的规范 CIDR；结果按 (网络地址, 前缀长度) 升序排列。
+    """
+
+    def diff(a: list[IPNetwork], b: list[IPNetwork]) -> list[IPNetwork]:
+        ranges_a = _collapse_ranges([_network_bounds(net) for net in a])
+        ranges_b = _collapse_ranges([_network_bounds(net) for net in b])
+        out: list[IPNetwork] = []
+        for segment in ranges_a:
+            for start, plen in _ranges_to_cidrs(
+                width, _subtract_ranges(segment, ranges_b)
+            ):
+                out.append(ipaddress.ip_network((start, plen), strict=True))
+        return out
+
+    added = diff(right, left)
+    removed = diff(left, right)
+    order = lambda n: (int(n.network_address), n.prefixlen)
+    added.sort(key=order)
+    removed.sort(key=order)
+    return added, removed
+
+
 # ---------------------------------------------------------------------------
 # 求解结果
 # ---------------------------------------------------------------------------

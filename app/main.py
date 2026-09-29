@@ -1,4 +1,4 @@
-"""FastAPI 接口：池状态/历史版本查询、预演与原子提交、部分回收、整批迁移与保留区替换。"""
+"""FastAPI 接口：池状态/历史版本查询、两版本地址用途比较、预演与原子提交、部分回收、整批迁移与保留区替换。"""
 from __future__ import annotations
 
 import ipaddress
@@ -242,6 +242,27 @@ class ReplaceReservationsResponse(BaseModel):
     free_cidrs: list[str]
 
 
+class VersionDiffResponse(BaseModel):
+    from_version: int = Field(..., description="比较起点版本号（旧快照）。")
+    to_version: int = Field(..., description="比较终点版本号（新快照）。")
+    reserved_added: list[str] = Field(
+        ...,
+        description=(
+            "保留地址新增：终点版本有、起点版本没有的地址，按地址集合"
+            "求差后折叠为数量最少的规范 CIDR，按 (网络地址, 前缀长度) 排序。"
+        ),
+    )
+    reserved_removed: list[str] = Field(
+        ..., description="保留地址移出：起点版本有、终点版本没有的地址。"
+    )
+    allocated_added: list[str] = Field(
+        ..., description="已分配地址新增：终点版本有、起点版本没有的地址。"
+    )
+    allocated_removed: list[str] = Field(
+        ..., description="已分配地址移出：起点版本有、终点版本没有的地址。"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 辅助
 # ---------------------------------------------------------------------------
@@ -301,6 +322,46 @@ def get_pool_version(
             status_code=404, detail=f"unknown pool version: {version}"
         )
     return _pool_info(state)
+
+
+@app.get(
+    "/api/pool/versions/{from_version}/diff/{to_version}",
+    response_model=VersionDiffResponse,
+    tags=["pool"],
+)
+def diff_pool_versions(
+    from_version: int, to_version: int, db: Database = Depends(get_db)
+) -> VersionDiffResponse:
+    """比较两个**已存历史版本**快照的地址用途变化（方向 from -> to）。
+
+    返回保留、已分配地址各自的新增（to 有 from 无）与移出（from 有 to
+    无）四个 CIDR 列表。比较基于两份**不可变快照**的**地址集合**而非
+    记录边界：同一地址集在一个版本记作一条 /24、另一版本记作两条相邻
+    /25（记录拆分）或反之（记录合并）时，两侧地址集合相等，四个列表均
+    不含该地址，不产生伪变化。每个差集都折叠为覆盖该地址集合且数量
+    最少的规范 CIDR，并按 (网络地址, 前缀长度) 升序返回。
+
+    数据全部取自版本快照表（只读），不读取也不改写当前地址池；两个版本
+    相同（含 from == to）时四个列表均为空。任一版本不存在（基线之前的
+    版本、尚未产生的未来版本）返回 404，绝不以当前池状态代替旧快照。
+    """
+    diff = db.get_version_diff(from_version, to_version)
+    if diff is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"unknown pool version in diff request: "
+                f"from={from_version}, to={to_version}"
+            ),
+        )
+    return VersionDiffResponse(
+        from_version=from_version,
+        to_version=to_version,
+        reserved_added=[str(n) for n in diff.reserved_added],
+        reserved_removed=[str(n) for n in diff.reserved_removed],
+        allocated_added=[str(n) for n in diff.allocated_added],
+        allocated_removed=[str(n) for n in diff.allocated_removed],
+    )
 
 
 @app.post(
