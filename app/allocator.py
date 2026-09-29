@@ -119,6 +119,31 @@ def _ranges_to_cidrs(
     return cidrs
 
 
+def _set_diff_cidrs(
+    base: list[IPNetwork],
+    subtract: list[IPNetwork],
+    width: int,
+) -> list[IPNetwork]:
+    """地址集合求差 ``base − subtract``，折叠为数量最少的规范 CIDR。
+
+    先把两侧各自合并为相交/相邻的整数区间（消除记录拆分/合并造成的
+    表示差异），再逐区间扣除，最后把剩余连续区间贪心切出最大对齐块。
+    因此结果只取决于两侧覆盖的**地址集合**，与各自的 CIDR 记录边界
+    无关：同一集合的任意两种记录写法得到的差集完全相同。
+    """
+    base_ranges = _collapse_ranges([_network_bounds(net) for net in base])
+    subtract_ranges = _collapse_ranges(
+        [_network_bounds(net) for net in subtract]
+    )
+    remaining: list[tuple[int, int]] = []
+    for bounds in base_ranges:
+        remaining.extend(_subtract_ranges(bounds, subtract_ranges))
+    return [
+        ipaddress.ip_network((start, plen), strict=True)
+        for start, plen in _ranges_to_cidrs(width, remaining)
+    ]
+
+
 # ---------------------------------------------------------------------------
 # 求解结果
 # ---------------------------------------------------------------------------

@@ -17,6 +17,8 @@
 
 **历史版本**：数据库首次升级时会给当前池版本补存一份**基线快照**；此后仅在分配提交、部分回收、整批迁移、保留区替换**成功**时，于各自写事务内为自增后的新版本保存该版本的父网段、保留与已分配 CIDR（失败操作整体回滚，不生成版本）。`GET /api/pool/versions/{version}` 返回指定版本的上述状态及据此计算的空闲 CIDR，未知版本返回 `404 Not Found`；快照只追加、从不更新，旧版本状态不随后续写入变化。
 
+**版本对比**：`GET /api/pool/versions/{from_version}/diff/{to_version}` 比较两个**已存历史版本快照**中保留与已分配地址各自的用途变化，返回相对 `from_version → to_version` 的新增（`added`）与移出（`removed`）CIDR 列表。比较按**地址集合**求差后折叠为**数量最少**的规范 CIDR，并按网络地址、前缀长度排序——仅因记录拆分或相邻记录合并（覆盖范围不变）不会产生伪变化。任一端口版本不存在即返回 `404 Not Found`，只读取历史快照，绝不以当前池状态代替，也不改写地址池与版本；两版本号相同时四个列表均为空。
+
 ---
 
 ## 一条命令启动
@@ -74,6 +76,7 @@ docker compose down -v         # 同时删除数据卷（彻底重置）
 | GET | `/healthz` | 健康检查 |
 | GET | `/api/pool` | 查询池状态：父网段、版本、保留/已分配子网、当前空闲 CIDR |
 | GET | `/api/pool/versions/{version}` | 查询**历史版本**快照：该版本的父网段、保留/已分配子网与据此计算的空闲 CIDR，未知版本 404 |
+| GET | `/api/pool/versions/{from_version}/diff/{to_version}` | 比较两个**历史版本**的保留/已分配地址用途变化：新增与移出 CIDR（集合求差 + 最少折叠），任一版本未知 404 |
 | POST | `/api/allocations/preview` | **预演**：不修改状态，返回池版本与最优方案 |
 | POST | `/api/allocations/commit` | **提交**：携带版本与方案，原子落库或返回 409 |
 | POST | `/api/allocations/reclaim` | **部分回收**：回收完全被已分配地址覆盖的规范 CIDR |
@@ -122,7 +125,48 @@ curl http://localhost:8000/api/pool/versions/3
 - 版本号必须是正整数：`GET /api/pool/versions/abc` 返回 `422 Unprocessable Entity`；
 - 查询不存在的版本（基线之前的版本、尚未产生的未来版本、0 或负数）返回 `404 Not Found`，响应体 `detail` 说明版本未知。
 
-### 3. 预演分配
+### 3. 比较两个历史版本的地址用途变化
+
+传入**起止两个已存版本号**，对保留地址与已分配地址分别比较两个版本快照的**地址集合**差异：
+
+```bash
+curl http://localhost:8000/api/pool/versions/2/diff/5
+```
+
+响应给出两个版本号，以及保留、已分配各自相对 `from_version → to_version` 的新增与移出列表：
+
+```json
+{
+  "from_version": 2,
+  "to_version": 5,
+  "reserved": {
+    "added": ["10.10.200.0/23"],
+    "removed": ["10.10.0.0/20", "10.10.255.0/24"]
+  },
+  "allocated": {
+    "added": ["10.10.128.0/24"],
+    "removed": ["10.10.64.0/23"]
+  }
+}
+```
+
+- `reserved.added` / `allocated.added`：存在于 `to_version` 但不存在于 `from_version` 的地址；
+- `reserved.removed` / `allocated.removed`：存在于 `from_version` 但不存在于 `to_version` 的地址；
+- 两侧均占用的地址不出现在任何列表中。
+
+语义与排序约定：
+
+- 比较基于**地址集合**而非 CIDR 记录：先按集合求差，再把差集折叠为覆盖范围相同且**数量最少**的规范 CIDR。某段地址在旧版本中是一条 `/23`、在新版本中被拆成两条 `/24`（或反之，两条相邻记录合并为一条），只要覆盖的地址范围不变，**不会出现在新增或移出列表中**，避免记录拆分 / 合并造成的伪变化；
+- 每个列表按**网络地址升序、再按前缀长度升序**排列；
+- 起止版本号**不要求递增**：传入任意两个已存版本即可，交换两个版本号时，`added` 与 `removed` 严格互换；两个版本号相同（如 `/2/diff/2`）时四个列表均为空。
+
+错误与只读约定：
+
+- 两个端口版本中**任一不存在**（基线之前的版本、尚未产生的未来版本、0 或负数）即返回 `404 Not Found`，响应体 `detail` 列出未知版本号；
+- 版本号必须是正整数，非整数（如 `abc`）返回 `422 Unprocessable Entity`；
+- 数据**只读取历史快照表**：绝不以当前池状态代替缺失的旧快照，接口为纯只读，不修改地址池与任何版本。
+
+### 4. 预演分配
 
 请求体 `prefix_lengths` 为 1～8 个前缀长度，**顺序即请求顺序**。
 
@@ -159,7 +203,7 @@ curl -X POST http://localhost:8000/api/allocations/preview \
 
 参数非法（空列表、超过 8 个、前缀越界等）返回 `422 Unprocessable Entity`。
 
-### 4. 提交分配（原子）
+### 5. 提交分配（原子）
 
 把预演返回的版本号与方案原样提交：
 
@@ -189,7 +233,7 @@ curl -X POST http://localhost:8000/api/allocations/commit \
 
 典型工作流：**先 preview 拿到 `pool_version` + `allocations`，再原样 commit**；若收到 409，则重新 preview 后重试。
 
-### 5. 回收已分配地址（部分回收，原子）
+### 6. 回收已分配地址（部分回收，原子）
 
 把当前池版本与一个**规范 CIDR** 提交到回收接口。该 CIDR 必须**完全由当前已分配地址覆盖**——可以恰好是一条分配记录，也可以跨越相邻的多条记录（例如两个相邻 `/25` 合成的 `/24`），也可以只覆盖某条记录的一部分。
 
@@ -229,7 +273,7 @@ CIDR 写法非规范（如主机位非零的 `10.1.0.1/24` 或无法解析）返
 
 > 回收不要求目标与既有分配记录的边界对齐，但目标本身必须是规范 CIDR；扣除后系统会重新规范化全部已分配地址，因此回收后 `allocated_cidrs` 里的记录集合可能与回收前完全不同（数目通常更少），其覆盖的地址集合则严格等于“原已分配集合减去目标”。
 
-### 6. 整批迁移已分配地址（同时迁移，原子）
+### 7. 整批迁移已分配地址（同时迁移，原子）
 
 把当前池版本与 **1～8 组** `from_cidr`/`to_cidr` 提交到迁移接口，系统按**整批同时迁移**的结果一次性完成搬运：每段来源被释放、每个目标被占用。
 
@@ -286,7 +330,7 @@ curl -X POST http://localhost:8000/api/allocations/relocate \
 
 输入非法时返回 `422 Unprocessable Entity`：组数为空或超过 8 个、CIDR 无法解析或写法非规范（如主机位非零的 `10.10.254.1/25`）、同组两端地址族或前缀长度不一致、来源之间或目标之间相互重叠、来源或目标越出父网段（含父网段的超网）或地址族与父网段不一致。
 
-### 7. 替换保留地址（整体替换，原子）
+### 8. 替换保留地址（整体替换，原子）
 
 把当前池版本与保留地址的**完整目标集合** `desired_cidrs` 提交到替换接口。目标集合允许为**空列表**（清空全部保留地址），也允许网段之间**重叠、包含或相邻**；落库时系统会合并相交/相邻区间，规范化为**覆盖范围相同且数量最少**的规范 CIDR 后整体重写保留记录。
 
@@ -369,6 +413,14 @@ curl -X POST http://localhost:8000/api/pool/reservations/replace \
   /api/pool/versions/{version}` 只读取快照表并据其内容重算空闲 CIDR，
   故旧版本状态**不随后续写入变化**。旧库首次升级时在初始化阶段（
   `_init_lock` 保护、独立事务）给当前版本补存基线，补存动作幂等。
+- **版本对比只依赖两份不可变快照**：两个端口版本的父网段、保留与已分配
+  CIDR 在**同一条 SQLite 读事务（WAL 快照）**内分别从快照表读取，与在线
+  池状态（`pool_meta` / `subnets`）完全无关；任一端口版本无快照即整体
+  返回 `404`，绝不会用当前池状态顶替缺失版本。差异按**地址集合**计算：
+  两侧 CIDR 先合并为相交/相邻的整数区间，逐区间求差后再把连续差集贪心
+  切分为数量最少的规范 CIDR，因此结果只取决于覆盖的地址集合——记录拆分
+  或相邻记录合并（覆盖范围不变）不产生任何新增/移出项。接口全程只执行
+  只读事务，不生成版本、不改写地址池。
 
 ---
 
@@ -389,6 +441,7 @@ python3 -m tests.test_reclaim                # 部分回收端到端：跨记录
 python3 -m tests.test_relocate               # 整批迁移：互换/链式/原地/重写/冲突/并发
 python3 -m tests.test_reservations_replace   # 保留区整体替换：规范化/冲突/并发
 python3 -m tests.test_versions               # 历史版本快照：基线/四类操作/404/不可变/旧库升级
+python3 -m tests.test_version_diff           # 两版本用途对比：集合求差/最少折叠/无伪变化/404/只读
 python3 -m tests.test_concurrency            # 并发交错回归：快照读取与提交响应绑定
 ```
 
@@ -408,6 +461,7 @@ tests/
   test_relocate.py
   test_reservations_replace.py
   test_versions.py
+  test_version_diff.py
   test_concurrency.py
 Dockerfile
 docker-compose.yml

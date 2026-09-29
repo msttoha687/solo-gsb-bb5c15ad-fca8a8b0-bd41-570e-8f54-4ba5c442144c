@@ -8,7 +8,7 @@ from typing import Literal
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
-from .allocator import CidrAllocationSolver, InfeasibleError
+from .allocator import CidrAllocationSolver, InfeasibleError, _set_diff_cidrs
 from .config import settings
 from .db import (
     ConflictError,
@@ -242,6 +242,20 @@ class ReplaceReservationsResponse(BaseModel):
     free_cidrs: list[str]
 
 
+class VersionDiff(BaseModel):
+    """一个用途（保留 / 已分配）相对另一版本的集合差。"""
+
+    added: list[str]
+    removed: list[str]
+
+
+class VersionDiffResponse(BaseModel):
+    from_version: int
+    to_version: int
+    reserved: VersionDiff
+    allocated: VersionDiff
+
+
 # ---------------------------------------------------------------------------
 # 辅助
 # ---------------------------------------------------------------------------
@@ -301,6 +315,66 @@ def get_pool_version(
             status_code=404, detail=f"unknown pool version: {version}"
         )
     return _pool_info(state)
+
+
+@app.get(
+    "/api/pool/versions/{from_version}/diff/{to_version}",
+    response_model=VersionDiffResponse,
+    tags=["pool"],
+)
+def diff_pool_versions(
+    from_version: int, to_version: int, db: Database = Depends(get_db)
+) -> VersionDiffResponse:
+    """比较两个**历史版本快照**中保留与已分配地址的用途变化。
+
+    两份状态均取自 ``pool_versions`` 不可变快照，与在线池状态无关：
+    任一版本不存在（基线之前、尚未产生、0 或负数）返回 ``404``，绝不
+    以当前池状态代替缺失快照；本接口为纯只读，不修改地址池与版本。
+
+    对每类地址（保留 / 已分配）分别按**地址集合**求差：
+
+    * ``added``：存在于 ``to_version`` 但不存在于 ``from_version``；
+    * ``removed``：存在于 ``from_version`` 但不存在于 ``to_version``。
+
+    差集折叠为覆盖范围相同且**数量最少**的规范 CIDR，按网络地址、再按
+    前缀长度升序排列。比较基于地址集合而非记录边界，因此记录被拆分或
+    相邻记录合并（覆盖范围不变）不会产生伪变化；两版本号相同时四个
+    列表均为空。起止版本号不要求递增：传入任意两个已存版本即可。
+    """
+    state_from, state_to = db.get_two_state_versions(
+        from_version, to_version
+    )
+    missing = [
+        v
+        for v, state in ((from_version, state_from), (to_version, state_to))
+        if state is None
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown pool version(s): {', '.join(map(str, missing))}",
+        )
+
+    def _diff(nets_from, nets_to) -> VersionDiff:
+        added = _set_diff_cidrs(
+            list(nets_to), list(nets_from), state_to.parent.max_prefixlen
+        )
+        removed = _set_diff_cidrs(
+            list(nets_from), list(nets_to), state_from.parent.max_prefixlen
+        )
+        # _set_diff_cidrs 已按网络地址升序；同地址时再以前缀长度升序。
+        key = lambda n: (int(n.network_address), n.prefixlen)
+        return VersionDiff(
+            added=[str(n) for n in sorted(added, key=key)],
+            removed=[str(n) for n in sorted(removed, key=key)],
+        )
+
+    return VersionDiffResponse(
+        from_version=from_version,
+        to_version=to_version,
+        reserved=_diff(state_from.reserved, state_to.reserved),
+        allocated=_diff(state_from.allocated, state_to.allocated),
+    )
 
 
 @app.post(

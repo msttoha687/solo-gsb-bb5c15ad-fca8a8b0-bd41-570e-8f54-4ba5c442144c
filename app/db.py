@@ -247,29 +247,26 @@ class Database:
             conn.commit()
         return state
 
-    def get_state_version(self, version: int) -> PoolState | None:
-        """读取**历史版本**的不可变快照；未知版本返回 ``None``。
+    @staticmethod
+    def _load_version_state(
+        conn: sqlite3.Connection, version: int
+    ) -> PoolState | None:
+        """在**当前事务的快照**内读取指定历史版本；未知版本返回 ``None``。
 
-        数据全部来自 ``pool_versions`` / ``pool_version_subnets`` 快照
-        表，与在线池状态（``pool_meta`` / ``subnets``）无关：后续写入只
-        追加新版本快照，从不修改旧版本行，因此旧快照不随后续写入变化。
-        父网段、保留与已分配 CIDR 在同一条读事务的快照内读取。
+        调用方必须已开启事务，保证 ``pool_versions`` 行与其
+        ``pool_version_subnets`` 行取自同一快照。
         """
-        with self._conn() as conn:
-            conn.execute("BEGIN")
-            meta = conn.execute(
-                "SELECT parent_cidr FROM pool_versions WHERE version = ?",
-                (version,),
-            ).fetchone()
-            if meta is None:
-                conn.commit()
-                return None
-            rows = conn.execute(
-                "SELECT cidr, kind FROM pool_version_subnets "
-                "WHERE version = ? ORDER BY cidr",
-                (version,),
-            ).fetchall()
-            conn.commit()
+        meta = conn.execute(
+            "SELECT parent_cidr FROM pool_versions WHERE version = ?",
+            (version,),
+        ).fetchone()
+        if meta is None:
+            return None
+        rows = conn.execute(
+            "SELECT cidr, kind FROM pool_version_subnets "
+            "WHERE version = ? ORDER BY cidr",
+            (version,),
+        ).fetchall()
         parent = ipaddress.ip_network(meta["parent_cidr"], strict=True)
         reserved = tuple(
             ipaddress.ip_network(r["cidr"], strict=True)
@@ -282,6 +279,36 @@ class Database:
             if r["kind"] == "allocated"
         )
         return PoolState(parent, version, reserved, allocated)
+
+    def get_state_version(self, version: int) -> PoolState | None:
+        """读取**历史版本**的不可变快照；未知版本返回 ``None``。
+
+        数据全部来自 ``pool_versions`` / ``pool_version_subnets`` 快照
+        表，与在线池状态（``pool_meta`` / ``subnets``）无关：后续写入只
+        追加新版本快照，从不修改旧版本行，因此旧快照不随后续写入变化。
+        父网段、保留与已分配 CIDR 在同一条读事务的快照内读取。
+        """
+        with self._conn() as conn:
+            conn.execute("BEGIN")
+            state = self._load_version_state(conn, version)
+            conn.commit()
+        return state
+
+    def get_two_state_versions(
+        self, version_a: int, version_b: int
+    ) -> tuple[PoolState | None, PoolState | None]:
+        """在**同一条读事务的快照**内读取两个历史版本。
+
+        全部数据只来自不可变快照表，与在线池状态无关，绝不读取
+        ``pool_meta`` / ``subnets``，因此不会以当前池状态代替缺失的旧
+        快照；两份快照的存在性与内容在同一 SQLite 快照下判定。
+        """
+        with self._conn() as conn:
+            conn.execute("BEGIN")
+            state_a = self._load_version_state(conn, version_a)
+            state_b = self._load_version_state(conn, version_b)
+            conn.commit()
+        return state_a, state_b
 
     # -- 原子提交 ----------------------------------------------------------
 
